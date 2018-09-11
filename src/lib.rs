@@ -18,6 +18,23 @@ use ur20::{
     ur20_fbc_mod_tcp::Coupler as MbCoupler, ur20_fbc_mod_tcp::*, Address, ChannelValue, ModuleType,
 };
 
+pub trait Coupler {
+    /// The actual coupler ID.
+    fn id(&self) -> &str;
+
+    /// Current input state.
+    fn inputs(&self) -> HashMap<Address, ChannelValue>;
+
+    /// Current output state.
+    fn outputs(&self) -> HashMap<Address, ChannelValue>;
+
+    /// Set the value of an output channel.
+    fn set_output(&self, addr: &Address, val: ChannelValue) -> Result<(), ur20::Error>;
+
+    /// This method behaves like [Coupler::tick] but it consumes the [Coupler] and returns it as [Future::Item].
+    fn tick_and_consume(self) -> Box<dyn Future<Item = Self, Error = Error>>;
+}
+
 /// A Modbus TCP fieldbus coupler (`UR20-FBC-MOD-TCP`) implementation.
 ///
 /// # Example:
@@ -28,19 +45,19 @@ use ur20::{
 ///
 /// use futures::Future;
 /// use tokio_core::reactor::Core;
-/// use ur20_modbus::Coupler;
+/// use ur20_modbus::{Coupler, TcpCoupler};
 ///
 /// let mut core = Core::new().unwrap();
 /// let handle = core.handle();
 /// let addr = "192.168.178.3:502".parse().unwrap();
-/// let client = Coupler::connect(addr, handle);
+/// let client = TcpCoupler::connect(addr, handle);
 /// let task = client.and_then(|client|{
 ///     println!("Connected to {}", client.id());
 ///     Ok(())
 /// });
 /// core.run(task).unwrap();
 ///```
-pub struct Coupler {
+pub struct TcpCoupler {
     id: String,
     client: Client,
     input_count: u16,
@@ -49,9 +66,9 @@ pub struct Coupler {
     coupler: RefCell<MbCoupler>,
 }
 
-impl Coupler {
+impl TcpCoupler {
     /// Connect to the coupler.
-    pub fn connect(addr: SocketAddr, handle: Handle) -> impl Future<Item = Coupler, Error = Error> {
+    pub fn connect(addr: SocketAddr, handle: Handle) -> impl Future<Item = Self, Error = Error> {
         let coupler = Client::connect_tcp(&addr, &handle)
             .and_then(|client| {
                 let coupler_id = read_coupler_id(&client);
@@ -113,7 +130,7 @@ impl Coupler {
                     };
                     let coupler =
                         MbCoupler::new(&cfg).map_err(|err| Error::new(ErrorKind::Other, err))?;
-                    Ok(Coupler {
+                    Ok(Self {
                         id,
                         client,
                         coupler: RefCell::new(coupler),
@@ -126,62 +143,10 @@ impl Coupler {
         coupler
     }
 
-    /// The actual coupler ID.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Current input state.
-    pub fn inputs(&self) -> HashMap<Address, ChannelValue> {
-        self.coupler
-            .borrow()
-            .inputs()
-            .clone()
-            .into_iter()
-            .enumerate()
-            .flat_map(|(module, vals)| {
-                vals.into_iter()
-                    .enumerate()
-                    .map(move |(channel, value)| (Address { module, channel }, value))
-            })
-            .collect()
-    }
-
-    /// Current output state.
-    pub fn outputs(&self) -> HashMap<Address, ChannelValue> {
-        self.coupler
-            .borrow()
-            .outputs()
-            .clone()
-            .into_iter()
-            .enumerate()
-            .flat_map(|(module, vals)| {
-                vals.into_iter()
-                    .enumerate()
-                    .map(move |(channel, value)| (Address { module, channel }, value))
-            })
-            .collect()
-    }
-
     /// List of modules.
     pub fn modules(&self) -> &[ModuleType] {
         // TODO: expose 'modules' in 'ur20' crate
         &self.modules
-    }
-
-    /// Set the value of an output channel.
-    pub fn set_output(&self, addr: &Address, val: ChannelValue) -> Result<(), ur20::Error> {
-        self.coupler.borrow_mut().set_output(addr, val)
-    }
-
-    fn input(&self) -> impl Future<Item = Vec<u16>, Error = Error> {
-        self.client
-            .read_input_registers(ADDR_PACKED_PROCESS_INPUT_DATA, self.input_count)
-    }
-
-    fn output(&self) -> impl Future<Item = Vec<u16>, Error = Error> {
-        self.client
-            .read_holding_registers(ADDR_PACKED_PROCESS_OUTPUT_DATA, self.output_count)
     }
 
     /// Read binary input data.
@@ -211,6 +176,16 @@ impl Coupler {
         map
     }
 
+    fn input(&self) -> impl Future<Item = Vec<u16>, Error = Error> {
+        self.client
+            .read_input_registers(ADDR_PACKED_PROCESS_INPUT_DATA, self.input_count)
+    }
+
+    fn output(&self) -> impl Future<Item = Vec<u16>, Error = Error> {
+        self.client
+            .read_holding_registers(ADDR_PACKED_PROCESS_OUTPUT_DATA, self.output_count)
+    }
+
     fn next_out(
         &self,
         input: &[u16],
@@ -231,9 +206,6 @@ impl Coupler {
         self.input().join(self.output())
     }
 
-    /// Run an I/O cycle.
-    /// This reads all process input registers and
-    /// writes to process output registers.
     pub fn tick<'a>(&'a self) -> impl Future<Item = (), Error = Error> + 'a {
         debug!("fetch data");
         self.get_data().and_then(move |(input, output)| {
@@ -243,16 +215,59 @@ impl Coupler {
             })
         })
     }
+}
 
-    /// This method behaves like [Coupler::tick] but it consumes the [Coupler] and returns it as [Future::Item].
-    pub fn tick_and_consume(self) -> impl Future<Item = Self, Error = Error> {
+impl Coupler for TcpCoupler {
+    /// The actual coupler ID.
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Current input state.
+    fn inputs(&self) -> HashMap<Address, ChannelValue> {
+        self.coupler
+            .borrow()
+            .inputs()
+            .clone()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(module, vals)| {
+                vals.into_iter()
+                    .enumerate()
+                    .map(move |(channel, value)| (Address { module, channel }, value))
+            })
+            .collect()
+    }
+
+    /// Current output state.
+    fn outputs(&self) -> HashMap<Address, ChannelValue> {
+        self.coupler
+            .borrow()
+            .outputs()
+            .clone()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(module, vals)| {
+                vals.into_iter()
+                    .enumerate()
+                    .map(move |(channel, value)| (Address { module, channel }, value))
+            })
+            .collect()
+    }
+
+    /// Set the value of an output channel.
+    fn set_output(&self, addr: &Address, val: ChannelValue) -> Result<(), ur20::Error> {
+        self.coupler.borrow_mut().set_output(addr, val)
+    }
+
+    fn tick_and_consume(self) -> Box<Future<Item = Self, Error = Error>> {
         debug!("fetch data");
-        self.get_data().and_then(move |(input, output)| {
+        Box::new(self.get_data().and_then(move |(input, output)| {
             self.next_out(&input, &output).and_then(move |output| {
                 debug!("write data");
                 self.write(&output).and_then(|_| Ok(self))
             })
-        })
+        }))
     }
 }
 
